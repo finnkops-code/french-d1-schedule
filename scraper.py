@@ -1,8 +1,7 @@
 import json
 import re
+import sys
 from datetime import datetime, timezone, timedelta
-
-from curl_cffi import requests
 
 SCHEDULE_URL = "https://ffbs.wbsc.org/fr/events/2026-championnat-de-france-division-1-baseball/schedule-and-results"
 FALLBACK_URL = "https://ffbs.wbsc.org/fr/events/2026-championnat-de-france-division-1-baseball/home"
@@ -17,6 +16,9 @@ TEAM_NAMES = {
     "SEN": "Templiers de Sénart",
     "TOU": "Tigers de Toulouse",
 }
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 # Wedstrijdblok in de platgeslagen HTML-tekst van ffbs.wbsc.org, bv.:
 #   Visiteurs BEZ 4 : 5 Recevant SEN D10505 09/05/2026 16:00 (UTC +2) - Score final
@@ -34,12 +36,10 @@ GAME_RE = re.compile(
 )
 
 
-def fetch_html(url):
-    """
-    ffbs.wbsc.org zit achter bot-detectie; curl_cffi met Chrome-
-    impersonatie (tier 1 van de anti-blocking strategie) komt er
-    vanuit GitHub Actions doorheen.
-    """
+# ── Tier 1: curl_cffi ─────────────────────────────────────────────────────────
+
+def fetch_curl_cffi(url):
+    from curl_cffi import requests
     resp = requests.get(
         url,
         impersonate="chrome",
@@ -49,6 +49,87 @@ def fetch_html(url):
     resp.raise_for_status()
     return resp.text
 
+
+# ── Tier 2 + 3: Playwright / window.fetch ─────────────────────────────────────
+
+def fetch_playwright(url):
+    """
+    Tier 2: pagina direct laden in headless Chromium.
+    Tier 3: als dat een 403/challenge geeft, eerst de site-root laden en
+    daarna de doelpagina via window.fetch vanuit de browsercontext ophalen —
+    die request komt dan met alle cookies/fingerprint van een echte pagina.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=UA,
+            locale="fr-FR",
+            viewport={"width": 1366, "height": 900},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = context.new_page()
+
+        # Tier 2: directe navigatie
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)
+            if resp and resp.status == 200:
+                html = page.content()
+                if GAME_RE.search(strip_tags(html)):
+                    browser.close()
+                    return html
+            print(f"   Tier 2: status {resp.status if resp else '?'} of geen wedstrijden, door naar tier 3")
+        except Exception as e:
+            print(f"   Tier 2 mislukt ({e}), door naar tier 3")
+
+        # Tier 3: window.fetch vanuit de paginacontext
+        try:
+            page.goto("https://ffbs.wbsc.org/fr/calendar",
+                      wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)
+            html = page.evaluate(
+                """async (url) => {
+                    const r = await fetch(url, {
+                        credentials: 'include',
+                        headers: {'Accept-Language': 'fr-FR,fr;q=0.9'}
+                    });
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return await r.text();
+                }""",
+                url,
+            )
+            browser.close()
+            return html
+        except Exception as e:
+            browser.close()
+            raise RuntimeError(f"Tier 3 (window.fetch) mislukt: {e}")
+
+
+def fetch_html(url):
+    print(f"   Tier 1: curl_cffi...")
+    try:
+        html = fetch_curl_cffi(url)
+        if GAME_RE.search(strip_tags(html)):
+            return html
+        print("   Tier 1: 200 maar geen wedstrijden gevonden, door naar Playwright")
+    except Exception as e:
+        print(f"   Tier 1 mislukt ({e}), door naar Playwright")
+
+    print(f"   Tier 2/3: Playwright...")
+    return fetch_playwright(url)
+
+
+# ── Parsing ───────────────────────────────────────────────────────────────────
 
 def strip_tags(html):
     html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
@@ -161,9 +242,10 @@ def main():
     for u in uitslagen:
         print(f"  {u['datum']} {u['thuis']} {u['score_thuis']}-{u['score_uit']} {u['uit']}")
 
-    if not uitslagen:
-        print("  ⚠️  Geen uitslagen gevonden — eerste 2000 tekens van de pagina:")
+    if not matches:
+        print("  ⚠️  Geen wedstrijden gevonden — eerste 2000 tekens van de pagina:")
         print(text[:2000])
+        sys.exit(1)
 
     output = {
         "bijgewerkt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
