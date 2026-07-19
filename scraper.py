@@ -1,7 +1,10 @@
 import json
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timezone, timedelta
+
+from curl_cffi import requests
 
 SCHEDULE_URL = "https://ffbs.wbsc.org/fr/events/2026-championnat-de-france-division-1-baseball/schedule-and-results"
 FALLBACK_URL = "https://ffbs.wbsc.org/fr/events/2026-championnat-de-france-division-1-baseball/home"
@@ -17,10 +20,7 @@ TEAM_NAMES = {
     "TOU": "Tigers de Toulouse",
 }
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-# Wedstrijdblok in de platgeslagen HTML-tekst van ffbs.wbsc.org, bv.:
+# Wedstrijdblok in de platgeslagen tekst van ffbs.wbsc.org, bv.:
 #   Visiteurs BEZ 4 : 5 Recevant SEN D10505 09/05/2026 16:00 (UTC +2) - Score final
 GAME_RE = re.compile(
     r"(?:Visiteurs|Away|Visitantes)\s+"
@@ -36,10 +36,28 @@ GAME_RE = re.compile(
 )
 
 
-# ── Tier 1: curl_cffi ─────────────────────────────────────────────────────────
+def normalize_text(content):
+    """
+    Maakt zowel HTML als markdown (reader-proxy output) plat naar
+    doorzoekbare tekst: scripts/styles/tags eruit, markdown-afbeeldingen
+    en -links eruit, whitespace samenvouwen.
+    """
+    content = re.sub(r"<script.*?</script>", " ", content, flags=re.DOTALL | re.IGNORECASE)
+    content = re.sub(r"<style.*?</style>", " ", content, flags=re.DOTALL | re.IGNORECASE)
+    content = re.sub(r"<[^>]+>", " ", content)
+    content = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", content)   # markdown afbeeldingen
+    content = re.sub(r"\[([^\]]*)\]\([^)]*\)", r" \1 ", content)  # markdown links
+    content = re.sub(r"https?://\S+", " ", content)           # kale URLs
+    return re.sub(r"\s+", " ", content)
 
-def fetch_curl_cffi(url):
-    from curl_cffi import requests
+
+# ── Fetch-tiers ───────────────────────────────────────────────────────────────
+# GitHub Actions-IP's worden door de WBSC-WAF geblokkeerd (403 op alles,
+# ook via Playwright/window.fetch). Tier 2 en 3 halen de pagina daarom op
+# via publieke proxy's die vanaf niet-geblokkeerde IP-ranges fetchen.
+
+def fetch_direct(url):
+    """Tier 1: direct met curl_cffi — voor het geval de blokkade ooit verdwijnt."""
     resp = requests.get(
         url,
         impersonate="chrome",
@@ -50,93 +68,54 @@ def fetch_curl_cffi(url):
     return resp.text
 
 
-# ── Tier 2 + 3: Playwright / window.fetch ─────────────────────────────────────
+def fetch_jina(url):
+    """Tier 2: r.jina.ai reader-proxy (geeft markdown terug)."""
+    resp = requests.get(
+        f"https://r.jina.ai/{url}",
+        timeout=60,
+        headers={"Accept": "text/plain"},
+    )
+    resp.raise_for_status()
+    return resp.text
 
-def fetch_playwright(url):
-    """
-    Tier 2: pagina direct laden in headless Chromium.
-    Tier 3: als dat een 403/challenge geeft, eerst de site-root laden en
-    daarna de doelpagina via window.fetch vanuit de browsercontext ophalen —
-    die request komt dan met alle cookies/fingerprint van een echte pagina.
-    """
-    from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
-        context = browser.new_context(
-            user_agent=UA,
-            locale="fr-FR",
-            viewport={"width": 1366, "height": 900},
-        )
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        page = context.new_page()
+def fetch_allorigins(url):
+    """Tier 3: allorigins proxy (geeft de ruwe HTML terug)."""
+    resp = requests.get(
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(url, safe='')}",
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.text
 
-        # Tier 2: directe navigatie
-        try:
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
-            if resp and resp.status == 200:
-                html = page.content()
-                if GAME_RE.search(strip_tags(html)):
-                    browser.close()
-                    return html
-            print(f"   Tier 2: status {resp.status if resp else '?'} of geen wedstrijden, door naar tier 3")
-        except Exception as e:
-            print(f"   Tier 2 mislukt ({e}), door naar tier 3")
 
-        # Tier 3: window.fetch vanuit de paginacontext
-        try:
-            page.goto("https://ffbs.wbsc.org/fr/calendar",
-                      wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
-            html = page.evaluate(
-                """async (url) => {
-                    const r = await fetch(url, {
-                        credentials: 'include',
-                        headers: {'Accept-Language': 'fr-FR,fr;q=0.9'}
-                    });
-                    if (!r.ok) throw new Error('HTTP ' + r.status);
-                    return await r.text();
-                }""",
-                url,
-            )
-            browser.close()
-            return html
-        except Exception as e:
-            browser.close()
-            raise RuntimeError(f"Tier 3 (window.fetch) mislukt: {e}")
+TIERS = [
+    ("direct (curl_cffi)", fetch_direct),
+    ("r.jina.ai reader",   fetch_jina),
+    ("allorigins",         fetch_allorigins),
+]
 
 
 def fetch_html(url):
-    print(f"   Tier 1: curl_cffi...")
-    try:
-        html = fetch_curl_cffi(url)
-        if GAME_RE.search(strip_tags(html)):
-            return html
-        print("   Tier 1: 200 maar geen wedstrijden gevonden, door naar Playwright")
-    except Exception as e:
-        print(f"   Tier 1 mislukt ({e}), door naar Playwright")
+    """
+    Probeert de tiers in volgorde; een tier telt pas als geslaagd
+    wanneer er daadwerkelijk wedstrijden in de tekst herkend worden
+    (een 200 met challenge-pagina telt dus als mislukt).
+    """
+    for naam, fetcher in TIERS:
+        print(f"   Tier: {naam}...")
+        try:
+            content = fetcher(url)
+            if GAME_RE.search(normalize_text(content)):
+                print(f"   ✓ Gelukt via {naam}")
+                return content
+            print(f"   ✗ {naam}: response zonder herkenbare wedstrijden")
+        except Exception as e:
+            print(f"   ✗ {naam} mislukt: {e}")
+    raise RuntimeError("Alle fetch-tiers mislukt")
 
-    print(f"   Tier 2/3: Playwright...")
-    return fetch_playwright(url)
 
-
-# ── Parsing ───────────────────────────────────────────────────────────────────
-
-def strip_tags(html):
-    html = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r"<style.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", html)
-    return re.sub(r"\s+", " ", text)
-
+# ── Speelronde & parsing ──────────────────────────────────────────────────────
 
 def speelronde_bounds():
     """
@@ -203,12 +182,12 @@ def parse_game(m):
 def main():
     print(f"Ophalen van {SCHEDULE_URL}...")
     try:
-        html = fetch_html(SCHEDULE_URL)
+        content = fetch_html(SCHEDULE_URL)
     except Exception as e:
         print(f"⚠️  Schemapagina mislukt ({e}), terugvallen op {FALLBACK_URL}")
-        html = fetch_html(FALLBACK_URL)
+        content = fetch_html(FALLBACK_URL)
 
-    text = strip_tags(html)
+    text = normalize_text(content)
     matches = list(GAME_RE.finditer(text))
     print(f"Wedstrijden gevonden: {len(matches)}")
 
@@ -243,7 +222,7 @@ def main():
         print(f"  {u['datum']} {u['thuis']} {u['score_thuis']}-{u['score_uit']} {u['uit']}")
 
     if not matches:
-        print("  ⚠️  Geen wedstrijden gevonden — eerste 2000 tekens van de pagina:")
+        print("  ⚠️  Geen wedstrijden gevonden — eerste 2000 tekens van de tekst:")
         print(text[:2000])
         sys.exit(1)
 
