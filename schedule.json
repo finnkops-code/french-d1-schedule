@@ -1,31 +1,11 @@
 {
-  "bijgewerkt": "2026-09-26T21:42:17Z",
+  "bijgewerkt": "2026-09-28T22:20:07Z",
   "bron": "https://baseballtv.fr/en/scores/",
   "speelronde": {
     "van": "2026-09-26",
     "tot": "2026-09-27"
   },
-  "uitslagen": [],
-  "programma": [
-    {
-      "id": "BTV-20260927-ROU-SAV-1300",
-      "datum": "2026-09-27",
-      "tijdstip": "13:00",
-      "dag": "zondag 27 september",
-      "thuis": "Lions de Savigny-sur-Orge",
-      "thuis_code": "SAV",
-      "uit": "Huskies de Rouen",
-      "uit_code": "ROU",
-      "score_thuis": null,
-      "score_uit": null,
-      "thuis_innings": [],
-      "uit_innings": [],
-      "innings": null,
-      "gamestatus": "",
-      "locatie": null,
-      "stadion": null,
-      "gespeeld": false
-    },
+  "uitslagen": [
     {
       "id": "BTV-20260927-ROU-SAV-1600",
       "datum": "2026-09-27",
@@ -35,15 +15,16 @@
       "thuis_code": "SAV",
       "uit": "Huskies de Rouen",
       "uit_code": "ROU",
-      "score_thuis": null,
-      "score_uit": null,
+      "score_thuis": 0,
+      "score_uit": 0,
       "thuis_innings": [],
       "uit_innings": [],
       "innings": null,
-      "gamestatus": "",
+      "gamestatus": "F",
       "locatie": null,
       "stadion": null,
-      "gespeeld": false
+      "gespeeld": true
     }
-  ]
+  ],
+  "programma": []
 }
